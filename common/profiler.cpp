@@ -1,3 +1,4 @@
+#include "win_compat.h"
 #include "log.h"
 #include "profiler.h"
 #include "ggml.h"

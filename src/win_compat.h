@@ -12,7 +12,19 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <psapi.h>     // PERFORMANCE_INFORMATION / GetPerformanceInfo (profiler.cpp)
+#include <process.h>   // _getpid
+#include <stdlib.h>    // _putenv_s
 #include <cstddef>
+
+// getpid + setenv shims for common/profiler.cpp (POSIX, absent on Windows).
+#ifndef getpid
+#define getpid _getpid
+#endif
+static inline int setenv(const char * name, const char * value, int overwrite) {
+    (void) overwrite;
+    return _putenv_s(name, value);
+}
 
 #ifndef _SC_PAGESIZE
 #define _SC_PAGESIZE 30

@@ -1071,11 +1071,19 @@ numjobs=%d
 }
 
 void device_disk_rnd_bw(float * read_rnd_bw, float * write_rnd_bw, int n_threads) {
+#ifdef _WIN32
+    (void) n_threads; *read_rnd_bw = 50.0f; *write_rnd_bw = 40.0f; // default; fio profiler not wired on Windows
+#else
     external_fio_impl(read_rnd_bw, write_rnd_bw, true, n_threads);
+#endif
 }
 
 void device_disk_seq_bw(float * read_seq_bw, float * write_seq_bw, int n_threads) {
+#ifdef _WIN32
+    (void) n_threads; *read_seq_bw = 500.0f; *write_seq_bw = 400.0f; // default; fio profiler not wired on Windows
+#else
     external_fio_impl(read_seq_bw, write_seq_bw, false, n_threads);
+#endif
 }
 
 float device_memory_bw(int n_thread) {

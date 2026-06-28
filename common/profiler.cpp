@@ -698,10 +698,16 @@ static uint64_t device_host_swap_memory(bool available) {
     PERFORMANCE_INFORMATION performance_info;
     performance_info.cb = sizeof(performance_info);
     if (GetPerformanceInfo(&performance_info, sizeof(performance_info))) {
+        // PERFORMANCE_INFORMATION has no PageFileTotal/PageFileUsage; derive the
+        // pagefile (swap) from CommitLimit/CommitTotal vs PhysicalTotal (pages).
+        uint64_t pf_total = (performance_info.CommitLimit > performance_info.PhysicalTotal)
+            ? (uint64_t)(performance_info.CommitLimit - performance_info.PhysicalTotal) : 0;
+        uint64_t pf_used = (performance_info.CommitTotal > performance_info.PhysicalTotal)
+            ? (uint64_t)(performance_info.CommitTotal - performance_info.PhysicalTotal) : 0;
         if (available) {
-            swap_memory = (performance_info.PageFileTotal - performance_info.PageFileUsage) * performance_info.PageSize;
+            swap_memory = (pf_total > pf_used ? pf_total - pf_used : 0) * (uint64_t)performance_info.PageSize;
         } else {
-            swap_memory = performance_info.PageFileTotal * performance_info.PageSize;
+            swap_memory = pf_total * (uint64_t)performance_info.PageSize;
         }
     }
 #elif defined(__linux__)

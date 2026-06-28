@@ -17,6 +17,8 @@ add_library(llama
             llama-vocab.cpp
             llama-grammar.cpp
             llama-sampling.cpp
+            network-utils.cpp
+            ../common/profiler.cpp
             unicode.h
             unicode.cpp
             unicode-data.cpp

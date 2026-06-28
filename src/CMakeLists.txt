@@ -20,7 +20,6 @@ add_library(llama
             unicode.h
             unicode.cpp
             unicode-data.cpp
-            device.cpp
             )
 
 target_include_directories(llama PUBLIC . ../include)

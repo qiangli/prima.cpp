@@ -1,3 +1,4 @@
+#include "win_compat.h"
 #include "zmq_addon.hpp"
 
 #include "llama-impl.h"

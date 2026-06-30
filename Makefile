@@ -989,6 +989,12 @@ OBJ_COMMON = \
 
 OBJ_ALL = $(OBJ_GGML) $(OBJ_LLAMA) $(OBJ_COMMON)
 
+# Static nng (MIT) must be fetched + built before any object that includes
+# zmq_nng_shim.hpp compiles. Make every object order-only-depend on it so a
+# fresh `make -j` cannot race the nng fetch (the binaries already depend on
+# $(NNG_LIB) for the link; this adds the compile-side ordering).
+$(OBJ_ALL): | $(NNG_LIB)
+
 LIB_GGML   = $(LIB_PRE)ggml$(DSO_EXT)
 LIB_GGML_S = $(LIB_PRE)ggml.a
 

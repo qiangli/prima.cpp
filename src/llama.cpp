@@ -1,4 +1,4 @@
-#include "zmq_addon.hpp"
+#include "zmq_nng_shim.hpp"
 
 #include "llama-impl.h"
 #include "llama-vocab.h"
@@ -20830,21 +20830,18 @@ int llama_rebuild_topo(llama_context * ctx,
 }
 
 int llama_forward_messages(llama_context *ctx) {
-    zmq::message_t message;
-    int more = true;
+    // Under nng each message is atomic (no ZMQ_RCVMORE part-streaming), so the
+    // whole multipart is received and re-sent in one shot. recv_multipart
+    // returns std::nullopt on RCVTIMEO, reproducing the original -1 timeout
+    // path. Single-frame messages are simply multiparts with one part.
     int timeout_ms = 10;
     ctx->recv_socket->setsockopt(ZMQ_RCVTIMEO, &timeout_ms, sizeof(timeout_ms));
-    while (more) {
-        auto recv_result = ctx->recv_socket->recv(message, zmq::recv_flags::none);
-        if (!recv_result) {
-            return -1;
-        }
-        size_t more_size = sizeof(more);
-        ctx->recv_socket->getsockopt(ZMQ_RCVMORE, &more, &more_size);
-        
-        ctx->send_socket->send(message, 
-            more ? zmq::send_flags::sndmore : zmq::send_flags::none);
+
+    std::vector<zmq::message_t> msgs;
+    if (!zmq::recv_multipart(*ctx->recv_socket, std::back_inserter(msgs))) {
+        return -1;
     }
+    zmq::send_multipart(*ctx->send_socket, msgs);
     return 0;
 }
 

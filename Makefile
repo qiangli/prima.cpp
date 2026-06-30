@@ -270,7 +270,25 @@ MK_CXXFLAGS  = -std=c++11 -fPIC
 MK_NVCCFLAGS = -std=c++11
 
 MK_CPPFLAGS += -isystem /usr/local/include
-MK_LDFLAGS  += -L/usr/local/lib -lzmq
+# MPL-free networking: static nng (MIT) + zmq_nng_shim.hpp replaces the
+# MPL-2.0 ZeroMQ library (-lzmq). nng is pinned to v1.9.0 and fetched +
+# built static into deps/ by the $(NNG_LIB) rule below -- no system
+# dependency, no absolute paths, nothing committed (deps/ is gitignored).
+NNG_DIR     = deps/nng
+NNG_LIB     = $(abspath $(NNG_DIR))/build/libnng.a
+MK_CPPFLAGS += -isystem $(abspath $(NNG_DIR))/include
+MK_LDFLAGS  += $(NNG_LIB)
+
+$(NNG_LIB):
+	@if [ ! -d $(NNG_DIR)/.git ]; then \
+		echo "==> fetching nng v1.9.0 (MIT) into $(NNG_DIR)"; \
+		git clone --depth 1 --branch v1.9.0 https://github.com/nanomsg/nng $(NNG_DIR); \
+	fi
+	@echo "==> building static libnng.a"
+	cmake -S $(NNG_DIR) -B $(NNG_DIR)/build \
+		-DBUILD_SHARED_LIBS=OFF -DNNG_TESTS=OFF -DNNG_ENABLE_TLS=OFF \
+		-DCMAKE_BUILD_TYPE=Release
+	cmake --build $(NNG_DIR)/build -j
 
 ifeq ($(UNAME_S),Darwin)
     MK_CPPFLAGS += -isystem /opt/homebrew/include
@@ -1304,9 +1322,10 @@ clean:
 GET_OBJ_FILE = $(patsubst %.c,%.o,$(patsubst %.cpp,%.o,$(patsubst %.cu,%.o,$(1))))
 
 llama-cli: examples/main/main.cpp \
+	$(NNG_LIB) \
 	$(OBJ_ALL)
 	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
-	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
+	$(CXX) $(CXXFLAGS) $(filter-out %.h %.a $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
 	@echo
 	@echo '====  Run ./llama-cli -h for help.  ===='
 	@echo
@@ -1506,9 +1525,10 @@ llama-server: \
 	examples/server/loading.html.hpp \
 	common/json.hpp \
 	common/stb_image.h \
+	$(NNG_LIB) \
 	$(OBJ_ALL)
 	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
-	$(CXX) $(CXXFLAGS) $(filter-out %.h %.hpp $<,$^) -Iexamples/server $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS) $(LWINSOCK2)
+	$(CXX) $(CXXFLAGS) $(filter-out %.h %.hpp %.a $<,$^) -Iexamples/server $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS) $(LWINSOCK2)
 
 # Portable equivalent of `cd examples/server/public && xxd -i $(notdir $<) ../$(notdir $<).hpp`:
 examples/server/%.hpp: examples/server/public/% Makefile

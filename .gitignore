@@ -141,3 +141,6 @@ poetry.toml
 # fio
 fio_test*
 *.fio
+
+# Fetched + built nng dependency (static libnng.a), not committed
+/deps/

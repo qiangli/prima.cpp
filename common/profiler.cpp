@@ -1020,7 +1020,23 @@ numjobs=%d
     }
 
     if (ret != 0) {
-        throw std::runtime_error("Engine posixaio and sync not loadable, fio test failed\n");
+        // Fail soft: on a clean node fio's IO engines (posixaio/sync) may not be
+        // loadable, which previously aborted the whole worker process. Instead of
+        // throwing, fall back to a sensible default disk bandwidth (~500 MB/s, a
+        // typical SSD) so the Halda scheduler still gets a finite, well-defined
+        // value. A finite default is preferred over 0 because read_bw is used as a
+        // divisor when estimating disk-load latency (0 would yield +inf/NaN).
+        const float default_bw = 0.5f; // GB/s (~500 MB/s, typical SSD)
+        LOG_WRN("fio disk test failed (engines not loadable); "
+                "falling back to default disk bandwidth %.2f GB/s\n", default_bw);
+        *read_bw  = default_bw;
+        *write_bw = default_bw;
+
+        // clean up temporary files before returning
+        std::remove(test_file.c_str());
+        std::remove(conf_file.c_str());
+        std::remove(output_file.c_str());
+        return;
     }
 
     // parse fio output

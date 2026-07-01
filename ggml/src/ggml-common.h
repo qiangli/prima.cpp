@@ -148,6 +148,13 @@ typedef struct {
 } block_q4_0;
 static_assert(sizeof(block_q4_0) == sizeof(ggml_half) + QK4_0 / 2, "wrong q4_0 block size/padding");
 
+#define QK_MXFP4 32
+typedef struct {
+    uint8_t e;                // E8M0 shared scale
+    uint8_t qs[QK_MXFP4 / 2]; // 4-bit FP4 (E2M1) quants, 2 per byte
+} block_mxfp4;
+static_assert(sizeof(block_mxfp4) == sizeof(uint8_t) + QK_MXFP4 / 2, "wrong mxfp4 block size/padding");
+
 #define QK4_1 32
 typedef struct {
     union {

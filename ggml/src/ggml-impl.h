@@ -8,6 +8,7 @@
 #include <stdlib.h> // load `stdlib.h` before other headers to work around MinGW bug: https://sourceforge.net/p/mingw-w64/bugs/192/
 #include <stdbool.h>
 #include <stdint.h>
+#include <string.h> // memcpy (used by ggml_e8m0_to_fp32* below)
 
 #ifdef __cplusplus
 extern "C" {
@@ -32,6 +33,37 @@ extern "C" {
 #endif
 #endif
 #endif
+
+// E8M0 (8-bit exponent, no mantissa) shared scale used by MXFP4.
+// A byte value X encodes the scale 2^(X-127); X==0 is the smallest subnormal.
+static inline float ggml_e8m0_to_fp32(uint8_t x) {
+    uint32_t bits;
+    if (x == 0) {
+        bits = 0x00400000;
+    } else {
+        bits = (uint32_t) x << 23;
+    }
+    float result;
+    memcpy(&result, &bits, sizeof(float));
+    return result;
+}
+
+// Half of ggml_e8m0_to_fp32(x). MXFP4 uses this "half" scale together with the
+// kvalues_mxfp4 table, whose entries are 2x the true E2M1 magnitudes.
+static inline float ggml_e8m0_to_fp32_half(uint8_t x) {
+    uint32_t bits;
+    if (x < 2) {
+        bits = 0x00200000 << x;
+    } else {
+        bits = (uint32_t)(x - 1) << 23;
+    }
+    float result;
+    memcpy(&result, &bits, sizeof(float));
+    return result;
+}
+
+#define GGML_E8M0_TO_FP32(x)      ggml_e8m0_to_fp32(x)
+#define GGML_E8M0_TO_FP32_HALF(x) ggml_e8m0_to_fp32_half(x)
 
 //
 // logging

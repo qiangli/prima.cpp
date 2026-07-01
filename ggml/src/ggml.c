@@ -6350,6 +6350,24 @@ struct ggml_tensor * ggml_soft_max_ext(
     return ggml_soft_max_impl(ctx, a, mask, scale, max_bias, false);
 }
 
+// attention sinks (gpt-oss): attach a per-head sink logit as src[2] of an
+// existing soft_max op. NULL is a no-op so callers can stay unconditional.
+void ggml_soft_max_add_sinks(
+        struct ggml_tensor * a,
+        struct ggml_tensor * sinks) {
+    if (!sinks) {
+        a->src[2] = NULL;
+        return;
+    }
+
+    GGML_ASSERT(a->op == GGML_OP_SOFT_MAX);
+    GGML_ASSERT(a->src[2] == NULL);
+    GGML_ASSERT(a->src[0]->ne[2] == sinks->ne[0]); // one sink per head
+    GGML_ASSERT(sinks->type == GGML_TYPE_F32);
+
+    a->src[2] = sinks;
+}
+
 // ggml_soft_max_back
 
 static struct ggml_tensor * ggml_soft_max_back_impl(
@@ -13804,6 +13822,7 @@ static void ggml_compute_forward_soft_max_f32(
 
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
+    const struct ggml_tensor * src2 = dst->src[2]; // attention sinks (optional)
 
     assert(ggml_is_contiguous(dst));
     assert(ggml_are_same_shape(src0, dst));
@@ -13845,6 +13864,9 @@ static void ggml_compute_forward_soft_max_f32(
 
     const bool use_f16 = (src1 && src1->type == GGML_TYPE_F16);
 
+    // attention sinks: F32, one learned logit per head [ne02] (NULL for models without sinks)
+    const float * sinks = src2 ? (const float *) src2->data : NULL;
+
     for (int i1 = ir0; i1 < ir1; i1++) {
         // ALiBi
         const uint32_t h = (i1/ne01)%ne02; // head
@@ -13881,7 +13903,21 @@ static void ggml_compute_forward_soft_max_f32(
         float max = -INFINITY;
         ggml_vec_max_f32(nc, &max, wp);
 
+        // if we have a sink for this head, fold it into the max as if it were
+        // one more (virtual) score participating in the softmax
+        if (sinks) {
+            max = MAX(max, sinks[h]);
+        }
+
+        // dp[i] = exp(wp[i] - max); sum = Σ_i exp(wp[i] - max) over the REAL scores only
         ggml_float sum = ggml_vec_soft_max_f32(nc, dp, wp, max);
+
+        // add the sink's contribution to the denominator; the sink has no output
+        // element, so it only steals probability mass from the normalization
+        if (sinks) {
+            sum += (ggml_float) expf(sinks[h] - max);
+        }
+
         assert(sum > 0.0);
 
         sum = 1.0/sum;

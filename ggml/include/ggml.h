@@ -1462,6 +1462,16 @@ extern "C" {
             float                 scale,
             float                 max_bias);
 
+    // attention sinks (gpt-oss): attach a learned per-head "sink" logit that
+    // participates in the softmax normalization (denominator) but does NOT get
+    // an output element. `a` must be a GGML_OP_SOFT_MAX tensor; `sinks` is F32,
+    // one value per head (shape [a->ne[2]]). Passing sinks == NULL is a no-op,
+    // and a soft_max without sinks behaves exactly as before.
+    // (adapted from upstream ggml_soft_max_add_sinks, PR ggml-org/llama.cpp#15091)
+    GGML_API void ggml_soft_max_add_sinks(
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * sinks);
+
     GGML_API struct ggml_tensor * ggml_soft_max_back(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,

@@ -7601,6 +7601,107 @@ static void llm_load_qwen2_tensors(
     }
 }
 
+static void llm_load_openai_moe_tensors(
+        llama_model_loader & ml,
+        llama_model        & model,
+        std::map<ggml_backend_buffer_type_t, ggml_context *> & ctx_map,
+        uint32_t             n_world,
+        uint32_t             my_rank,
+        const uint32_t     * n_layer_window,
+        bool               * use_mmap_buffer,
+        bool                 set_needed) {
+    (void) use_mmap_buffer; // gpt-oss loads split expert tensors directly; mmap unaffected
+    const auto tn = LLM_TN(model.arch);
+
+    ggml_context * ctx_input        = nullptr;
+    ggml_context * ctx_output       = nullptr;
+    ggml_context * ctx_output_split = nullptr;
+
+    if (my_rank == 0) {
+        ctx_input        = ctx_map.at(model.buft_input.buft);
+        ctx_output       = ctx_map.at(model.buft_output.buft);
+        ctx_output_split = ctx_map.at(model.buft_output.buft_matrix);
+    }
+
+    auto ctx_for_layer       = [&](int i) { return ctx_map.at(model.buft_layer[i].buft); };
+    auto ctx_for_layer_split = [&](int i) { return ctx_map.at(model.buft_layer[i].buft_matrix); };
+
+    const llama_hparams hparams = model.hparams;
+    const int64_t n_head        = hparams.n_head();
+    const int64_t n_head_kv     = hparams.n_head_kv();
+    const int64_t n_embd        = hparams.n_embd;
+    const int64_t n_embd_head_k = hparams.n_embd_head_k;
+    const int64_t n_ff          = hparams.n_ff();
+    const int64_t n_vocab       = hparams.n_vocab;
+    const int64_t n_expert      = hparams.n_expert;
+    const int64_t n_expert_used = hparams.n_expert_used;
+    const int64_t n_layer       = hparams.n_layer;
+
+    // gpt-oss: MoE transformer, per-head attention sinks, qkv+output
+    // biases, MXFP4 expert tensors, two per-layer norms (input +
+    // post-attention which doubles as the pre-FFN norm).
+    // Distributed layer-window form (mirrors llm_load_llama_tensors):
+    // rank 0 owns tok_embd + output; every rank loads ONLY the layers
+    // in its window, keyed by the global tensor name (i) but stored at
+    // the local slot (map_layer_to_local_id). set_needed so the
+    // owned weights survive the ml.weights.erase(!is_needed) pass.
+    if (my_rank == 0) {
+        model.tok_embd = ml.create_tensor(ctx_input, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0, set_needed);
+
+        // output
+        model.output_norm = ml.create_tensor(ctx_output,       tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0, set_needed);
+        model.output      = ml.create_tensor(ctx_output_split, tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, 0, set_needed);
+    }
+
+    GGML_ASSERT(n_expert      > 0);
+    GGML_ASSERT(n_expert_used > 0);
+
+    const int64_t n_embd_q  = n_head    * n_embd_head_k;
+    const int64_t n_embd_kv = n_head_kv * n_embd_head_k;
+    const int64_t n_ff_exp  = hparams.n_ff_exp ? hparams.n_ff_exp : n_ff;
+
+    for (int i = 0; i < n_layer; ++i) {
+        if (!this_layer_is_mine(i, n_world, my_rank, n_layer_window)) {
+            continue;
+        }
+        int local_i = map_layer_to_local_id(i, n_world, my_rank, n_layer_window);
+
+        ggml_context * ctx_layer = ctx_for_layer(local_i);
+        ggml_context * ctx_split = ctx_for_layer_split(local_i);
+
+        auto & layer = model.layers[local_i];
+
+        layer.attn_norm      = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_NORM,      "weight", i), {n_embd}, 0, set_needed);
+        layer.attn_post_norm = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_POST_NORM, "weight", i), {n_embd}, 0, set_needed);
+
+        // attention (q/k/v/o) with biases
+        layer.wq = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_Q,   "weight", i), {n_embd, n_embd_q}, 0, set_needed);
+        layer.wk = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_K,   "weight", i), {n_embd, n_embd_kv}, 0, set_needed);
+        layer.wv = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_V,   "weight", i), {n_embd, n_embd_kv}, 0, set_needed);
+        layer.wo = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_q, n_embd}, 0, set_needed);
+
+        layer.bq = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_Q,   "bias", i), {n_embd_q}, 0, set_needed);
+        layer.bk = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_K,   "bias", i), {n_embd_kv}, 0, set_needed);
+        layer.bv = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_V,   "bias", i), {n_embd_kv}, 0, set_needed);
+        layer.bo = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_OUT, "bias", i), {n_embd}, 0, set_needed);
+
+        // per-head attention sinks (F32, one logit per head)
+        layer.attn_sinks = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_SINKS, "weight", i), {n_head}, 0, set_needed);
+
+        // MoE router + experts (MXFP4) with biases
+        layer.ffn_gate_inp   = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert}, 0, set_needed);
+        layer.ffn_gate_inp_b = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_GATE_INP, "bias",   i), {n_expert}, 0, set_needed);
+
+        layer.ffn_gate_exps = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_expert}, 0, set_needed);
+        layer.ffn_down_exps = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, 0, set_needed);
+        layer.ffn_up_exps   = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff_exp, n_expert}, 0, set_needed);
+
+        layer.ffn_gate_exps_b = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_GATE_EXPS, "bias", i), {n_ff_exp, n_expert}, 0, set_needed);
+        layer.ffn_down_exps_b = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_DOWN_EXPS, "bias", i), {  n_embd, n_expert}, 0, set_needed);
+        layer.ffn_up_exps_b   = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_UP_EXPS,   "bias", i), {n_ff_exp, n_expert}, 0, set_needed);
+    }
+}
+
 // Returns false if cancelled by progress_callback
 static bool llm_load_tensors_impl(
         llama_model_loader   &  ml,
@@ -8328,71 +8429,8 @@ static bool llm_load_tensors_impl(
                     }
                 } break;
             case LLM_ARCH_OPENAI_MOE:
-                {
-                    // gpt-oss: MoE transformer, per-head attention sinks, qkv+output
-                    // biases, MXFP4 expert tensors, two per-layer norms (input +
-                    // post-attention which doubles as the pre-FFN norm).
-                    // Distributed layer-window form (mirrors llm_load_llama_tensors):
-                    // rank 0 owns tok_embd + output; every rank loads ONLY the layers
-                    // in its window, keyed by the global tensor name (i) but stored at
-                    // the local slot (map_layer_to_local_id). set_needed=true so the
-                    // owned weights survive the ml.weights.erase(!is_needed) pass.
-                    if (my_rank == 0) {
-                        model.tok_embd = ml.create_tensor(ctx_input, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0, true);
-
-                        // output
-                        model.output_norm = ml.create_tensor(ctx_output,       tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0, true);
-                        model.output      = ml.create_tensor(ctx_output_split, tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, 0, true);
-                    }
-
-                    GGML_ASSERT(n_expert      > 0);
-                    GGML_ASSERT(n_expert_used > 0);
-
-                    const int64_t n_embd_q  = n_head    * n_embd_head_k;
-                    const int64_t n_embd_kv = n_head_kv * n_embd_head_k;
-                    const int64_t n_ff_exp  = hparams.n_ff_exp ? hparams.n_ff_exp : n_ff;
-
-                    for (int i = 0; i < n_layer; ++i) {
-                        if (!this_layer_is_mine(i, n_world, my_rank, n_layer_window)) {
-                            continue;
-                        }
-                        int local_i = map_layer_to_local_id(i, n_world, my_rank, n_layer_window);
-
-                        ggml_context * ctx_layer = ctx_for_layer(local_i);
-                        ggml_context * ctx_split = ctx_for_layer_split(local_i);
-
-                        auto & layer = model.layers[local_i];
-
-                        layer.attn_norm      = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_NORM,      "weight", i), {n_embd}, 0, true);
-                        layer.attn_post_norm = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_POST_NORM, "weight", i), {n_embd}, 0, true);
-
-                        // attention (q/k/v/o) with biases
-                        layer.wq = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_Q,   "weight", i), {n_embd, n_embd_q}, 0, true);
-                        layer.wk = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_K,   "weight", i), {n_embd, n_embd_kv}, 0, true);
-                        layer.wv = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_V,   "weight", i), {n_embd, n_embd_kv}, 0, true);
-                        layer.wo = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_q, n_embd}, 0, true);
-
-                        layer.bq = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_Q,   "bias", i), {n_embd_q}, 0, true);
-                        layer.bk = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_K,   "bias", i), {n_embd_kv}, 0, true);
-                        layer.bv = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_V,   "bias", i), {n_embd_kv}, 0, true);
-                        layer.bo = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_OUT, "bias", i), {n_embd}, 0, true);
-
-                        // per-head attention sinks (F32, one logit per head)
-                        layer.attn_sinks = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_SINKS, "weight", i), {n_head}, 0, true);
-
-                        // MoE router + experts (MXFP4) with biases
-                        layer.ffn_gate_inp   = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert}, 0, true);
-                        layer.ffn_gate_inp_b = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_GATE_INP, "bias",   i), {n_expert}, 0, true);
-
-                        layer.ffn_gate_exps = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_expert}, 0, true);
-                        layer.ffn_down_exps = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, 0, true);
-                        layer.ffn_up_exps   = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff_exp, n_expert}, 0, true);
-
-                        layer.ffn_gate_exps_b = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_GATE_EXPS, "bias", i), {n_ff_exp, n_expert}, 0, true);
-                        layer.ffn_down_exps_b = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_DOWN_EXPS, "bias", i), {  n_embd, n_expert}, 0, true);
-                        layer.ffn_up_exps_b   = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_UP_EXPS,   "bias", i), {n_ff_exp, n_expert}, 0, true);
-                    }
-                } break;
+                llm_load_openai_moe_tensors(ml, model, ctx_map, n_world, my_rank, n_layer_window, &use_mmap_buffer, true);
+                break;
             case LLM_ARCH_PHI2:
                 {
                     model.tok_embd = ml.create_tensor(ctx_input, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab});
@@ -22608,6 +22646,9 @@ void llama_model_n_flops(
                 break;
             case LLM_ARCH_QWEN2:
                 llm_load_qwen2_tensors(*ml, *model, ctx_map, 1, 0, n_layer_window, false);
+                break;
+            case LLM_ARCH_OPENAI_MOE:
+                llm_load_openai_moe_tensors(*ml, *model, ctx_map, 1, 0, n_layer_window, &use_mmap_buffer, false);
                 break;
             default:
                 throw std::runtime_error("unsupported architecture\n");

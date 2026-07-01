@@ -8332,15 +8332,15 @@ static bool llm_load_tensors_impl(
                     // gpt-oss: MoE transformer, per-head attention sinks, qkv+output
                     // biases, MXFP4 expert tensors, two per-layer norms (input +
                     // post-attention which doubles as the pre-FFN norm).
-                    // NOTE: prima.cpp's legacy per-arch tensor path (this switch) must pass
-                    // set_needed=true so weights survive the ml.weights.erase(!is_needed) pass;
-                    // the migrated arches (llama/qwen2) thread this via their llm_load_*_tensors
-                    // helpers. Single-node correct (my_layers == n_layer); distributed gpt-oss
-                    // would need per-owned-layer threading like the migrated helpers.
-                    model.tok_embd = ml.create_tensor(ctx_input, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0, true);
+                    // Distributed layer-window form (mirrors llm_load_llama_tensors):
+                    // rank 0 owns tok_embd + output; every rank loads ONLY the layers
+                    // in its window, keyed by the global tensor name (i) but stored at
+                    // the local slot (map_layer_to_local_id). set_needed=true so the
+                    // owned weights survive the ml.weights.erase(!is_needed) pass.
+                    if (my_rank == 0) {
+                        model.tok_embd = ml.create_tensor(ctx_input, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0, true);
 
-                    // output
-                    {
+                        // output
                         model.output_norm = ml.create_tensor(ctx_output,       tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0, true);
                         model.output      = ml.create_tensor(ctx_output_split, tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, 0, true);
                     }
@@ -8353,10 +8353,15 @@ static bool llm_load_tensors_impl(
                     const int64_t n_ff_exp  = hparams.n_ff_exp ? hparams.n_ff_exp : n_ff;
 
                     for (int i = 0; i < n_layer; ++i) {
-                        ggml_context * ctx_layer = ctx_for_layer(i);
-                        ggml_context * ctx_split = ctx_for_layer_split(i);
+                        if (!this_layer_is_mine(i, n_world, my_rank, n_layer_window)) {
+                            continue;
+                        }
+                        int local_i = map_layer_to_local_id(i, n_world, my_rank, n_layer_window);
 
-                        auto & layer = model.layers[i];
+                        ggml_context * ctx_layer = ctx_for_layer(local_i);
+                        ggml_context * ctx_split = ctx_for_layer_split(local_i);
+
+                        auto & layer = model.layers[local_i];
 
                         layer.attn_norm      = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_NORM,      "weight", i), {n_embd}, 0, true);
                         layer.attn_post_norm = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_POST_NORM, "weight", i), {n_embd}, 0, true);
@@ -13241,19 +13246,43 @@ struct llm_build_context {
         return gf;
     }
 
-    struct ggml_cgraph * build_openai_moe() {
-        struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, llama_model_max_nodes(model), false);
-
+    std::vector<ggml_cgraph *> build_openai_moe() {
         // mutable variable, needed during the last layer of the computation to skip unused tokens
         int32_t n_tokens = this->n_tokens;
 
         const int64_t n_embd_head = hparams.n_embd_head_k;
         GGML_ASSERT(n_embd_head == hparams.n_embd_head_v);
 
-        struct ggml_tensor * cur;
-        struct ggml_tensor * inpL;
+        // create a vector to hold the subgraphs (distributed layer-window form,
+        // mirroring build_llama/build_qwen2): rank 0 emits the input-embedding and
+        // output subgraphs, every rank emits one subgraph per contiguous window of
+        // owned layers, and the pipelined ring send/recv happens at the window
+        // boundaries via inpB (backend_embd) / out_embd wired by the runtime.
+        std::vector<struct ggml_cgraph *> sub_gfs;
+        struct ggml_cgraph * sub_gf  = nullptr;
+        struct ggml_tensor * cur     = nullptr;
+        struct ggml_tensor * inpL    = nullptr;
+        struct ggml_tensor * inpB    = nullptr;
+        const  uint32_t      n_world = this->cparams.n_world;
+        const  uint32_t      my_rank = this->cparams.rank;
+        const  uint32_t    * n_layer_window = this->cparams.n_layer_window;
 
-        inpL = llm_build_inp_embd(ctx0, lctx, hparams, batch, model.tok_embd, cb);
+        if (my_rank == 0) {
+            sub_gf = ggml_new_graph_custom(ctx0, llama_model_max_nodes(model), false);
+
+            // inp_embd - contains the input embedding
+            inpL = llm_build_inp_embd(ctx0, lctx, hparams, batch, model.tok_embd, cb);
+
+            // build the input layer as a seperate subgraph
+            ggml_build_forward_expand(sub_gf, inpL);
+            sub_gfs.push_back(sub_gf);
+
+            sub_gf = nullptr;
+            inpL   = nullptr;
+        }
+
+        // inpB - contains the output embedding from other nodes (ring recv)
+        inpB = llm_build_backend_embd(ctx0, lctx, hparams, batch, cb);
 
         // inp_pos - contains the positions
         struct ggml_tensor * inp_pos = build_inp_pos();
@@ -13264,30 +13293,53 @@ struct llm_build_context {
         struct ggml_tensor * KQ_mask_swa = build_inp_KQ_mask_swa(true);
 
         for (int il = 0; il < n_layer; ++il) {
+            if (!this_layer_is_mine(il, n_world, my_rank, n_layer_window)) {
+                // if we have an active sub-graph, add it to the list
+                if (sub_gf != nullptr && inpL != nullptr) {
+                    ggml_build_forward_expand(sub_gf, cur);
+                    sub_gfs.push_back(sub_gf);
+                    sub_gf = nullptr;
+                }
+                if (inpL != inpB) {
+                    inpL = inpB;
+                }
+                continue;
+            }
+
+            if (inpL == nullptr) {
+                inpL = inpB;
+            }
+
+            // start a new sub-graph
+            if (sub_gf == nullptr) {
+                sub_gf = ggml_new_graph_custom(ctx0, llama_model_max_nodes(model), false);
+            }
+
             // even layers use sliding-window attention, odd layers full attention
             struct ggml_tensor * KQ_mask_l = (il % 2 == 0) ? KQ_mask_swa : KQ_mask;
 
             struct ggml_tensor * inpSA = inpL;
+            int local_il = map_layer_to_local_id(il, n_world, my_rank, n_layer_window);
 
             // norm (input_layernorm)
             cur = llm_build_norm(ctx0, inpL, hparams,
-                    model.layers[il].attn_norm, NULL,
+                    model.layers[local_il].attn_norm, NULL,
                     LLM_NORM_RMS, cb, il);
             cb(cur, "attn_norm", il);
 
             // self-attention
             {
                 // compute Q, K, V (with biases) and RoPE Q, K
-                struct ggml_tensor * Qcur = llm_build_lora_mm(lctx, ctx0, model.layers[il].wq, cur);
-                Qcur = ggml_add(ctx0, Qcur, model.layers[il].bq);
+                struct ggml_tensor * Qcur = llm_build_lora_mm(lctx, ctx0, model.layers[local_il].wq, cur);
+                Qcur = ggml_add(ctx0, Qcur, model.layers[local_il].bq);
                 cb(Qcur, "Qcur", il);
 
-                struct ggml_tensor * Kcur = llm_build_lora_mm(lctx, ctx0, model.layers[il].wk, cur);
-                Kcur = ggml_add(ctx0, Kcur, model.layers[il].bk);
+                struct ggml_tensor * Kcur = llm_build_lora_mm(lctx, ctx0, model.layers[local_il].wk, cur);
+                Kcur = ggml_add(ctx0, Kcur, model.layers[local_il].bk);
                 cb(Kcur, "Kcur", il);
 
-                struct ggml_tensor * Vcur = llm_build_lora_mm(lctx, ctx0, model.layers[il].wv, cur);
-                Vcur = ggml_add(ctx0, Vcur, model.layers[il].bv);
+                struct ggml_tensor * Vcur = llm_build_lora_mm(lctx, ctx0, model.layers[local_il].wv, cur);
+                Vcur = ggml_add(ctx0, Vcur, model.layers[local_il].bv);
                 cb(Vcur, "Vcur", il);
 
                 Qcur = ggml_rope_ext(
@@ -13305,17 +13357,16 @@ struct llm_build_context {
                 cb(Kcur, "Kcur", il);
 
                 // attention with per-head sinks; scale 1/sqrt(head_dim)
-                cur = llm_build_kv(ctx0, lctx, kv_self, gf,
-                        model.layers[il].wo, model.layers[il].bo,
+                cur = llm_build_kv(ctx0, lctx, kv_self, sub_gf,
+                        model.layers[local_il].wo, model.layers[local_il].bo,
                         Kcur, Vcur, Qcur, KQ_mask_l, n_tokens, kv_head, n_kv,
                         1.0f/sqrtf(float(n_embd_head)), cb, il,
-                        model.layers[il].attn_sinks);
+                        model.layers[local_il].attn_sinks);
             }
 
             if (il == n_layer - 1) {
                 // skip computing output for unused tokens
                 struct ggml_tensor * inp_out_ids = build_inp_out_ids();
-                n_tokens = n_outputs;
                 cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
                 inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
             }
@@ -13325,24 +13376,24 @@ struct llm_build_context {
 
             // post_attention_layernorm doubles as the pre-FFN norm in gpt-oss
             cur = llm_build_norm(ctx0, ffn_inp, hparams,
-                    model.layers[il].attn_post_norm, NULL,
+                    model.layers[local_il].attn_post_norm, NULL,
                     LLM_NORM_RMS, cb, il);
             cb(cur, "attn_post_norm", il);
 
             // MoE FFN (routed experts, clamped SwiGLU, softmax-weight gating)
             cur = llm_build_moe_ffn(ctx0, lctx, cur,
-                    model.layers[il].ffn_gate_inp,
-                    model.layers[il].ffn_up_exps,
-                    model.layers[il].ffn_gate_exps,
-                    model.layers[il].ffn_down_exps,
+                    model.layers[local_il].ffn_gate_inp,
+                    model.layers[local_il].ffn_up_exps,
+                    model.layers[local_il].ffn_gate_exps,
+                    model.layers[local_il].ffn_down_exps,
                     n_expert, n_expert_used,
                     LLM_FFN_SWIGLU_OAI_MOE, false,
                     false, 0.0,
                     cb, il,
-                    model.layers[il].ffn_gate_inp_b,
-                    model.layers[il].ffn_up_exps_b,
-                    model.layers[il].ffn_gate_exps_b,
-                    model.layers[il].ffn_down_exps_b,
+                    model.layers[local_il].ffn_gate_inp_b,
+                    model.layers[local_il].ffn_up_exps_b,
+                    model.layers[local_il].ffn_gate_exps_b,
+                    model.layers[local_il].ffn_down_exps_b,
                     /* gate_softmax_weight */ true);
             cb(cur, "ffn_moe_out", il);
 
@@ -13353,20 +13404,35 @@ struct llm_build_context {
             inpL = cur;
         }
 
-        cur = inpL;
+        // add the last active sub-graph to the list
+        if (sub_gf != nullptr) {
+            ggml_build_forward_expand(sub_gf, cur);
+            sub_gfs.push_back(sub_gf);
+            sub_gf = nullptr;
+        }
 
-        cur = llm_build_norm(ctx0, cur, hparams,
-                model.output_norm, NULL,
-                LLM_NORM_RMS, cb, -1);
-        cb(cur, "result_norm", -1);
+        // output norm and lm_head
+        if (my_rank == 0) {
+            // start a new sub-graph for the output
+            sub_gf = ggml_new_graph_custom(ctx0, llama_model_max_nodes(model), false);
 
-        // lm_head
-        cur = llm_build_lora_mm(lctx, ctx0, model.output, cur);
-        cb(cur, "result_output", -1);
+            cur = llm_build_out_embd(ctx0, lctx, hparams, cb);
 
-        ggml_build_forward_expand(gf, cur);
+            cur = llm_build_norm(ctx0, cur, hparams,
+                    model.output_norm, NULL,
+                    LLM_NORM_RMS, cb, -1);
+            cb(cur, "result_norm", -1);
 
-        return gf;
+            // lm_head
+            cur = llm_build_lora_mm(lctx, ctx0, model.output, cur);
+            cb(cur, "result_output", -1);
+
+            ggml_build_forward_expand(sub_gf, cur);
+            sub_gfs.push_back(sub_gf);
+            sub_gf = nullptr;
+        }
+
+        return sub_gfs;
     }
 
     struct ggml_cgraph * build_phi2() {
@@ -17278,11 +17344,11 @@ static std::vector<struct ggml_cgraph *> llama_build_graph(
             ggml_set_name(cur, name);
         }
 
-        // build_llama/build_qwen2 split the model into one subgraph per layer-window
-        // (sched[0] = embeddings/output, sched[i>0] = layer windows), so sub_gf_id
-        // indexes lctx.sched directly. Monolithic single-graph arches (e.g. gpt-oss /
-        // OPENAI_MOE) return one cgraph, so lctx.sched is resized to 1 and every tensor
-        // lives in sched[0]. Clamp so the per-tensor backend hints below stay in range.
+        // The migrated arches (llama/qwen2/gpt-oss OPENAI_MOE) split the model into one
+        // subgraph per layer-window (sched[0] = input-embd, sched[i>0] = layer windows,
+        // last = output on rank 0), so sub_gf_id indexes lctx.sched directly and the
+        // clamp is a no-op. It stays only as a safety net for any legacy arch still
+        // returning a single monolithic cgraph (lctx.sched resized to 1).
         const int sched_idx = sub_gf_id < (int) lctx.sched.size() ? sub_gf_id : (int) lctx.sched.size() - 1;
 
         if (!lctx.cparams.offload_kqv) {
@@ -17376,7 +17442,7 @@ static std::vector<struct ggml_cgraph *> llama_build_graph(
             } break;
         case LLM_ARCH_OPENAI_MOE:
             {
-                result.push_back(llm.build_openai_moe());
+                result = llm.build_openai_moe();
             } break;
         case LLM_ARCH_PHI2:
             {
@@ -18834,11 +18900,11 @@ static int llama_decode_internal(
             }
 
             ubatch.activate_input  = (my_rank == 0 && i == 0);
-            // For a monolithic single-graph arch (e.g. gpt-oss / OPENAI_MOE) gf.size()==1,
-            // so i==0 is simultaneously the input and the output subgraph. The one graph
-            // computes end-to-end and emits "result_output" directly (extracted via `res`
-            // below), so the inter-node out_embd injection path must NOT fire — feeding the
-            // input tokens wins. Keep the two mutually exclusive.
+            // On rank 0 the input-embd subgraph (i==0) and the output subgraph
+            // (i==gf.size()-1) are distinct in the layer-window form, so activate_input
+            // and activate_output are naturally exclusive. The !activate_input guard is
+            // retained as a safety net for any legacy single-graph arch where gf.size()==1
+            // makes i==0 both the input and output subgraph (feeding input tokens wins).
             ubatch.activate_output = (my_rank == 0 && is_out_embd && !ubatch.activate_input);
             GGML_ASSERT(!(ubatch.activate_input && ubatch.activate_output));
             

@@ -256,6 +256,7 @@ enum llm_arch {
     LLM_ARCH_GRANITE,
     LLM_ARCH_GRANITE_MOE,
     LLM_ARCH_CHAMELEON,
+    LLM_ARCH_OPENAI_MOE,
     LLM_ARCH_UNKNOWN,
 };
 
@@ -309,6 +310,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_GRANITE,         "granite"      },
     { LLM_ARCH_GRANITE_MOE,     "granitemoe"   },
     { LLM_ARCH_CHAMELEON,       "chameleon"    },
+    { LLM_ARCH_OPENAI_MOE,      "gpt-oss"      },
     { LLM_ARCH_UNKNOWN,         "(unknown)"    },
 };
 
@@ -557,6 +559,7 @@ enum llm_tensor {
     LLM_TENSOR_ATTN_NORM_2,
     LLM_TENSOR_ATTN_OUT_NORM,
     LLM_TENSOR_ATTN_POST_NORM,
+    LLM_TENSOR_ATTN_SINKS, // gpt-oss: per-head attention sink logits
     LLM_TENSOR_ATTN_ROT_EMBD,
     LLM_TENSOR_FFN_GATE_INP,
     LLM_TENSOR_FFN_GATE_INP_SHEXP,
@@ -1564,6 +1567,25 @@ static const std::map<llm_arch, std::map<llm_tensor, const char *>> LLM_TENSOR_N
             { LLM_TENSOR_FFN_UP,          "blk.%d.ffn_up" },
             { LLM_TENSOR_ATTN_Q_NORM,     "blk.%d.attn_q_norm" },
             { LLM_TENSOR_ATTN_K_NORM,     "blk.%d.attn_k_norm" },
+        },
+    },
+    {
+        LLM_ARCH_OPENAI_MOE,
+        {
+            { LLM_TENSOR_TOKEN_EMBD,      "token_embd" },
+            { LLM_TENSOR_OUTPUT_NORM,     "output_norm" },
+            { LLM_TENSOR_OUTPUT,          "output" },
+            { LLM_TENSOR_ATTN_NORM,       "blk.%d.attn_norm" },
+            { LLM_TENSOR_ATTN_POST_NORM,  "blk.%d.post_attention_norm" },
+            { LLM_TENSOR_ATTN_Q,          "blk.%d.attn_q" },
+            { LLM_TENSOR_ATTN_K,          "blk.%d.attn_k" },
+            { LLM_TENSOR_ATTN_V,          "blk.%d.attn_v" },
+            { LLM_TENSOR_ATTN_OUT,        "blk.%d.attn_output" },
+            { LLM_TENSOR_ATTN_SINKS,      "blk.%d.attn_sinks" },
+            { LLM_TENSOR_FFN_GATE_INP,    "blk.%d.ffn_gate_inp" },
+            { LLM_TENSOR_FFN_GATE_EXPS,   "blk.%d.ffn_gate_exps" },
+            { LLM_TENSOR_FFN_DOWN_EXPS,   "blk.%d.ffn_down_exps" },
+            { LLM_TENSOR_FFN_UP_EXPS,     "blk.%d.ffn_up_exps" },
         },
     },
     {
@@ -2709,6 +2731,13 @@ struct llama_layer {
     struct ggml_tensor * ffn_gate_exps;
     struct ggml_tensor * ffn_down_exps;
     struct ggml_tensor * ffn_up_exps ;
+
+    // ff MoE bias + attention sinks (gpt-oss)
+    struct ggml_tensor * ffn_gate_inp_b  = nullptr;
+    struct ggml_tensor * ffn_gate_exps_b = nullptr;
+    struct ggml_tensor * ffn_down_exps_b = nullptr;
+    struct ggml_tensor * ffn_up_exps_b   = nullptr;
+    struct ggml_tensor * attn_sinks      = nullptr;
 
     // ff shared expert (shexp)
     struct ggml_tensor * ffn_gate_inp_shexp;
@@ -6262,6 +6291,24 @@ static void llm_load_hparams(
                     default: model.type = e_model::MODEL_UNKNOWN;
                }
             } break;
+        case LLM_ARCH_OPENAI_MOE:
+            {
+                // gpt-oss: MoE transformer with alternating sliding-window / full
+                // attention (period 2), per-head attention sinks and YaRN rope.
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+                ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,  hparams.n_ff_exp, false);
+
+                // sliding-window size (SWA layers); n_expert / n_expert_used are read
+                // by the common hparams loader from expert_count / expert_used_count.
+                hparams.n_swa = 128; // gpt-oss default sliding window
+                ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa, false);
+
+                switch (hparams.n_layer) {
+                    case 24: model.type = e_model::MODEL_UNKNOWN; break; // gpt-oss-20b
+                    case 36: model.type = e_model::MODEL_UNKNOWN; break; // gpt-oss-120b
+                    default: model.type = e_model::MODEL_UNKNOWN;
+                }
+            } break;
         case LLM_ARCH_STARCODER2:
             {
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_EPS, hparams.f_norm_eps);
@@ -6840,6 +6887,10 @@ static void llm_load_vocab(
                 tokenizer_pre == "chameleon") {
                 vocab.type_pre = LLAMA_VOCAB_PRE_TYPE_CHAMELEON;
                 vocab.tokenizer_add_bos = true;
+                vocab.tokenizer_clean_spaces = false;
+            } else if (
+                tokenizer_pre == "gpt-4o") {
+                vocab.type_pre = LLAMA_VOCAB_PRE_TYPE_GPT4O;
                 vocab.tokenizer_clean_spaces = false;
             } else {
                 throw std::runtime_error(format("unknown pre-tokenizer type: '%s'", tokenizer_pre.c_str()));
@@ -8276,6 +8327,67 @@ static bool llm_load_tensors_impl(
                         layer.ffn_up_shexp   = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {    n_embd, n_ff_shexp});
                     }
                 } break;
+            case LLM_ARCH_OPENAI_MOE:
+                {
+                    // gpt-oss: MoE transformer, per-head attention sinks, qkv+output
+                    // biases, MXFP4 expert tensors, two per-layer norms (input +
+                    // post-attention which doubles as the pre-FFN norm).
+                    // NOTE: prima.cpp's legacy per-arch tensor path (this switch) must pass
+                    // set_needed=true so weights survive the ml.weights.erase(!is_needed) pass;
+                    // the migrated arches (llama/qwen2) thread this via their llm_load_*_tensors
+                    // helpers. Single-node correct (my_layers == n_layer); distributed gpt-oss
+                    // would need per-owned-layer threading like the migrated helpers.
+                    model.tok_embd = ml.create_tensor(ctx_input, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0, true);
+
+                    // output
+                    {
+                        model.output_norm = ml.create_tensor(ctx_output,       tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0, true);
+                        model.output      = ml.create_tensor(ctx_output_split, tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, 0, true);
+                    }
+
+                    GGML_ASSERT(n_expert      > 0);
+                    GGML_ASSERT(n_expert_used > 0);
+
+                    const int64_t n_embd_q  = n_head    * n_embd_head_k;
+                    const int64_t n_embd_kv = n_head_kv * n_embd_head_k;
+                    const int64_t n_ff_exp  = hparams.n_ff_exp ? hparams.n_ff_exp : n_ff;
+
+                    for (int i = 0; i < n_layer; ++i) {
+                        ggml_context * ctx_layer = ctx_for_layer(i);
+                        ggml_context * ctx_split = ctx_for_layer_split(i);
+
+                        auto & layer = model.layers[i];
+
+                        layer.attn_norm      = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_NORM,      "weight", i), {n_embd}, 0, true);
+                        layer.attn_post_norm = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_POST_NORM, "weight", i), {n_embd}, 0, true);
+
+                        // attention (q/k/v/o) with biases
+                        layer.wq = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_Q,   "weight", i), {n_embd, n_embd_q}, 0, true);
+                        layer.wk = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_K,   "weight", i), {n_embd, n_embd_kv}, 0, true);
+                        layer.wv = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_V,   "weight", i), {n_embd, n_embd_kv}, 0, true);
+                        layer.wo = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_q, n_embd}, 0, true);
+
+                        layer.bq = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_Q,   "bias", i), {n_embd_q}, 0, true);
+                        layer.bk = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_K,   "bias", i), {n_embd_kv}, 0, true);
+                        layer.bv = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_V,   "bias", i), {n_embd_kv}, 0, true);
+                        layer.bo = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_OUT, "bias", i), {n_embd}, 0, true);
+
+                        // per-head attention sinks (F32, one logit per head)
+                        layer.attn_sinks = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_SINKS, "weight", i), {n_head}, 0, true);
+
+                        // MoE router + experts (MXFP4) with biases
+                        layer.ffn_gate_inp   = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert}, 0, true);
+                        layer.ffn_gate_inp_b = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_GATE_INP, "bias",   i), {n_expert}, 0, true);
+
+                        layer.ffn_gate_exps = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_expert}, 0, true);
+                        layer.ffn_down_exps = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, 0, true);
+                        layer.ffn_up_exps   = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff_exp, n_expert}, 0, true);
+
+                        layer.ffn_gate_exps_b = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_GATE_EXPS, "bias", i), {n_ff_exp, n_expert}, 0, true);
+                        layer.ffn_down_exps_b = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_DOWN_EXPS, "bias", i), {  n_embd, n_expert}, 0, true);
+                        layer.ffn_up_exps_b   = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_UP_EXPS,   "bias", i), {n_ff_exp, n_expert}, 0, true);
+                    }
+                } break;
             case LLM_ARCH_PHI2:
                 {
                     model.tok_embd = ml.create_tensor(ctx_input, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab});
@@ -9625,6 +9737,7 @@ enum llm_ffn_op_type {
     LLM_FFN_RELU,
     LLM_FFN_RELU_SQR,
     LLM_FFN_SWIGLU,
+    LLM_FFN_SWIGLU_OAI_MOE, // gpt-oss clamped swiglu (alpha=1.702, limit=7.0)
 };
 
 enum llm_ffn_gate_type {
@@ -9901,6 +10014,9 @@ static struct ggml_tensor * llm_build_ffn(
                 cur = ggml_mul(ctx, x0, x1);
                 cb(cur, "ffn_mul", il);
             } break;
+        case LLM_FFN_SWIGLU_OAI_MOE:
+            // MoE-only activation (gpt-oss); not valid for the dense FFN path
+            GGML_ABORT("LLM_FFN_SWIGLU_OAI_MOE is only supported in llm_build_moe_ffn");
     }
 
     if (type_gate == LLM_FFN_PAR) {
@@ -9943,14 +10059,26 @@ static struct ggml_tensor * llm_build_moe_ffn(
                        bool   scale_w,
                       float   w_scale,
          const llm_build_cb & cb,
-                        int   il) {
+                        int   il,
+        // optional gpt-oss extensions (default nullptr/false keeps existing callers unchanged)
+         struct ggml_tensor * gate_inp_b = nullptr,
+         struct ggml_tensor * up_exps_b = nullptr,
+         struct ggml_tensor * gate_exps_b = nullptr,
+         struct ggml_tensor * down_exps_b = nullptr,
+                       bool   gate_softmax_weight = false) {
     int64_t n_embd = cur->ne[0];
     int64_t n_tokens = cur->ne[1];
 
     ggml_tensor * logits = llm_build_lora_mm(lctx, ctx, gate_inp, cur); // [n_expert, n_tokens]
+    if (gate_inp_b) {
+        logits = ggml_add(ctx, logits, gate_inp_b); // router bias (gpt-oss)
+    }
     cb(logits, "ffn_moe_logits", il);
 
-    ggml_tensor * probs = ggml_soft_max(ctx, logits); // [n_expert, n_tokens]
+    // gpt-oss uses SOFTMAX_WEIGHT gating: selection is over raw logits, and the
+    // softmax is applied later over the selected experts' weights only. All other
+    // arches softmax over all experts before selection.
+    ggml_tensor * probs = gate_softmax_weight ? logits : ggml_soft_max(ctx, logits); // [n_expert, n_tokens]
     cb(probs, "ffn_moe_probs", il);
 
     // select experts
@@ -9961,6 +10089,14 @@ static struct ggml_tensor * llm_build_moe_ffn(
     ggml_tensor * weights = ggml_get_rows(ctx,
             ggml_reshape_3d(ctx, probs, 1, n_expert, n_tokens), selected_experts); // [1, n_expert_used, n_tokens]
     cb(weights, "ffn_moe_weights", il);
+
+    if (gate_softmax_weight) {
+        // softmax over the n_expert_used selected weights (gpt-oss)
+        weights = ggml_reshape_2d(ctx, weights, n_expert_used, n_tokens);
+        weights = ggml_soft_max(ctx, weights); // [n_expert_used, n_tokens]
+        weights = ggml_reshape_3d(ctx, weights, 1, n_expert_used, n_tokens);
+        cb(weights, "ffn_moe_weights_softmax", il);
+    }
 
     if (norm_w) {
         weights = ggml_reshape_2d(ctx, weights, n_expert_used, n_tokens);
@@ -9978,32 +10114,71 @@ static struct ggml_tensor * llm_build_moe_ffn(
         cb(weights, "ffn_moe_weights_scaled", il);
     }
 
+    // per-selected-expert bias (gpt-oss); emulates upstream ggml_add_id.
+    // The bias tensors are 2D [d, n_expert] (no token dim), so we cannot feed the
+    // [n_expert_used, n_tokens] ids straight into ggml_get_rows (it requires
+    // a->ne[2] == ids->ne[1]). Instead flatten the ids to 1D (contiguous — top_k
+    // returns a non-contiguous view), select the per-(expert,token) rows, then
+    // reshape back to [d, n_expert_used, n_tokens] to broadcast-add onto up/gate/down.
+    ggml_tensor * bias_ids = nullptr;
+    if (up_exps_b || gate_exps_b || down_exps_b) {
+        bias_ids = ggml_reshape_1d(ctx, ggml_cont(ctx, selected_experts), n_expert_used * n_tokens);
+    }
+    auto add_expert_bias = [&](ggml_tensor * x, ggml_tensor * b_exps) {
+        ggml_tensor * b = ggml_get_rows(ctx, b_exps, bias_ids); // [d, n_expert_used*n_tokens]
+        b = ggml_reshape_3d(ctx, b, b_exps->ne[0], n_expert_used, n_tokens);
+        return ggml_add(ctx, x, b);
+    };
+
     cur = ggml_reshape_3d(ctx, cur, n_embd, 1, n_tokens);
     ggml_tensor * up = llm_build_lora_mm_id(lctx, ctx, up_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
+    if (up_exps_b) {
+        up = add_expert_bias(up, up_exps_b);
+    }
     cb(up, "ffn_moe_up", il);
 
     ggml_tensor * gate = llm_build_lora_mm_id(lctx, ctx, gate_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
+    if (gate_exps_b) {
+        gate = add_expert_bias(gate, gate_exps_b);
+    }
     cb(gate, "ffn_moe_gate", il);
 
+    ggml_tensor * par;
     switch (type_op) {
         case LLM_FFN_SILU:
             {
                 gate = ggml_silu(ctx, gate);
                 cb(gate, "ffn_moe_silu", il);
+                par = ggml_mul(ctx, up, gate); // [n_ff, n_expert_used, n_tokens]
             } break;
         case LLM_FFN_GELU:
             {
                 gate = ggml_gelu(ctx, gate);
                 cb(gate, "ffn_moe_gelu", il);
+                par = ggml_mul(ctx, up, gate);
+            } break;
+        case LLM_FFN_SWIGLU_OAI_MOE:
+            {
+                // gpt-oss clamped SwiGLU:
+                //   glu = gate_clamped(<=limit) * sigmoid(alpha * gate_clamped)
+                //   out = glu * (up_clamped([-limit,limit]) + 1) = glu*up + glu
+                const float alpha = 1.702f;
+                const float limit = 7.0f;
+                gate = ggml_clamp(ctx, gate, -INFINITY, limit);
+                up   = ggml_clamp(ctx, up, -limit, limit);
+                ggml_tensor * glu = ggml_mul(ctx, gate, ggml_sigmoid(ctx, ggml_scale(ctx, gate, alpha)));
+                par = ggml_add(ctx, ggml_mul(ctx, glu, up), glu);
+                cb(par, "ffn_moe_swiglu_oai", il);
             } break;
         default:
             GGML_ABORT("fatal error");
     }
-
-    ggml_tensor * par = ggml_mul(ctx, up, gate); // [n_ff, n_expert_used, n_tokens]
     cb(par, "ffn_moe_gate_par", il);
 
     ggml_tensor * experts = llm_build_lora_mm_id(lctx, ctx, down_exps, par, selected_experts); // [n_embd, n_expert_used, n_tokens]
+    if (down_exps_b) {
+        experts = add_expert_bias(experts, down_exps_b);
+    }
     cb(experts, "ffn_moe_down", il);
 
     experts = ggml_mul(ctx, experts, weights);
@@ -10042,7 +10217,8 @@ static struct ggml_tensor * llm_build_kqv(
                     int32_t   n_kv,
                     float     kq_scale,
          const llm_build_cb & cb,
-                    int       il) {
+                    int       il,
+         struct ggml_tensor * sinks) {
     const llama_model   & model          = lctx.model;
     const llama_hparams & hparams        = lctx.model.hparams;
     const llama_cparams & cparams        = lctx.cparams;
@@ -10124,6 +10300,9 @@ static struct ggml_tensor * llm_build_kqv(
         }
 
         kq = ggml_soft_max_ext(ctx, kq, kq_mask, kq_scale, hparams.f_max_alibi_bias);
+        // gpt-oss: attach per-head attention sink logits to the softmax denominator
+        // (no-op when sinks == nullptr). CPU non-flash path only.
+        ggml_soft_max_add_sinks(kq, sinks);
         cb(kq, "kq_soft_max_ext", il);
 
         GGML_ASSERT(kv.size == n_ctx);
@@ -10180,7 +10359,8 @@ static struct ggml_tensor * llm_build_kv(
                     int32_t   n_kv,
                     float     kq_scale,
          const llm_build_cb & cb,
-                    int       il) {
+                    int       il,
+         struct ggml_tensor * sinks = nullptr) {
     const llama_hparams & hparams = lctx.model.hparams;
     const llama_cparams & cparams = lctx.cparams;
 
@@ -10194,7 +10374,7 @@ static struct ggml_tensor * llm_build_kv(
 
     struct ggml_tensor * cur;
 
-    cur  = llm_build_kqv(ctx, lctx, kv, graph, wo, wo_b, q_cur, kq_mask, n_tokens, n_kv, kq_scale, cb, il);
+    cur  = llm_build_kqv(ctx, lctx, kv, graph, wo, wo_b, q_cur, kq_mask, n_tokens, n_kv, kq_scale, cb, il, sinks);
     cb(cur, "kqv_out", il);
 
     return cur;
@@ -13039,6 +13219,134 @@ struct llm_build_context {
 
             cur = ggml_add(ctx0, cur, ffn_inp);
             cur = lctx.cvec.apply_to(ctx0, cur, il);
+            cb(cur, "l_out", il);
+
+            // input for next layer
+            inpL = cur;
+        }
+
+        cur = inpL;
+
+        cur = llm_build_norm(ctx0, cur, hparams,
+                model.output_norm, NULL,
+                LLM_NORM_RMS, cb, -1);
+        cb(cur, "result_norm", -1);
+
+        // lm_head
+        cur = llm_build_lora_mm(lctx, ctx0, model.output, cur);
+        cb(cur, "result_output", -1);
+
+        ggml_build_forward_expand(gf, cur);
+
+        return gf;
+    }
+
+    struct ggml_cgraph * build_openai_moe() {
+        struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, llama_model_max_nodes(model), false);
+
+        // mutable variable, needed during the last layer of the computation to skip unused tokens
+        int32_t n_tokens = this->n_tokens;
+
+        const int64_t n_embd_head = hparams.n_embd_head_k;
+        GGML_ASSERT(n_embd_head == hparams.n_embd_head_v);
+
+        struct ggml_tensor * cur;
+        struct ggml_tensor * inpL;
+
+        inpL = llm_build_inp_embd(ctx0, lctx, hparams, batch, model.tok_embd, cb);
+
+        // inp_pos - contains the positions
+        struct ggml_tensor * inp_pos = build_inp_pos();
+
+        // gpt-oss alternates sliding-window (SWA) and full attention per layer,
+        // so it needs both masks (period 2: even layers = sliding, odd = full).
+        struct ggml_tensor * KQ_mask     = build_inp_KQ_mask(true);
+        struct ggml_tensor * KQ_mask_swa = build_inp_KQ_mask_swa(true);
+
+        for (int il = 0; il < n_layer; ++il) {
+            // even layers use sliding-window attention, odd layers full attention
+            struct ggml_tensor * KQ_mask_l = (il % 2 == 0) ? KQ_mask_swa : KQ_mask;
+
+            struct ggml_tensor * inpSA = inpL;
+
+            // norm (input_layernorm)
+            cur = llm_build_norm(ctx0, inpL, hparams,
+                    model.layers[il].attn_norm, NULL,
+                    LLM_NORM_RMS, cb, il);
+            cb(cur, "attn_norm", il);
+
+            // self-attention
+            {
+                // compute Q, K, V (with biases) and RoPE Q, K
+                struct ggml_tensor * Qcur = llm_build_lora_mm(lctx, ctx0, model.layers[il].wq, cur);
+                Qcur = ggml_add(ctx0, Qcur, model.layers[il].bq);
+                cb(Qcur, "Qcur", il);
+
+                struct ggml_tensor * Kcur = llm_build_lora_mm(lctx, ctx0, model.layers[il].wk, cur);
+                Kcur = ggml_add(ctx0, Kcur, model.layers[il].bk);
+                cb(Kcur, "Kcur", il);
+
+                struct ggml_tensor * Vcur = llm_build_lora_mm(lctx, ctx0, model.layers[il].wv, cur);
+                Vcur = ggml_add(ctx0, Vcur, model.layers[il].bv);
+                cb(Vcur, "Vcur", il);
+
+                Qcur = ggml_rope_ext(
+                    ctx0, ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens), inp_pos, nullptr,
+                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                    ext_factor, attn_factor, beta_fast, beta_slow
+                );
+                cb(Qcur, "Qcur", il);
+
+                Kcur = ggml_rope_ext(
+                    ctx0, ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), inp_pos, nullptr,
+                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                    ext_factor, attn_factor, beta_fast, beta_slow
+                );
+                cb(Kcur, "Kcur", il);
+
+                // attention with per-head sinks; scale 1/sqrt(head_dim)
+                cur = llm_build_kv(ctx0, lctx, kv_self, gf,
+                        model.layers[il].wo, model.layers[il].bo,
+                        Kcur, Vcur, Qcur, KQ_mask_l, n_tokens, kv_head, n_kv,
+                        1.0f/sqrtf(float(n_embd_head)), cb, il,
+                        model.layers[il].attn_sinks);
+            }
+
+            if (il == n_layer - 1) {
+                // skip computing output for unused tokens
+                struct ggml_tensor * inp_out_ids = build_inp_out_ids();
+                n_tokens = n_outputs;
+                cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
+                inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
+            }
+
+            struct ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
+            cb(ffn_inp, "ffn_inp", il);
+
+            // post_attention_layernorm doubles as the pre-FFN norm in gpt-oss
+            cur = llm_build_norm(ctx0, ffn_inp, hparams,
+                    model.layers[il].attn_post_norm, NULL,
+                    LLM_NORM_RMS, cb, il);
+            cb(cur, "attn_post_norm", il);
+
+            // MoE FFN (routed experts, clamped SwiGLU, softmax-weight gating)
+            cur = llm_build_moe_ffn(ctx0, lctx, cur,
+                    model.layers[il].ffn_gate_inp,
+                    model.layers[il].ffn_up_exps,
+                    model.layers[il].ffn_gate_exps,
+                    model.layers[il].ffn_down_exps,
+                    n_expert, n_expert_used,
+                    LLM_FFN_SWIGLU_OAI_MOE, false,
+                    false, 0.0,
+                    cb, il,
+                    model.layers[il].ffn_gate_inp_b,
+                    model.layers[il].ffn_up_exps_b,
+                    model.layers[il].ffn_gate_exps_b,
+                    model.layers[il].ffn_down_exps_b,
+                    /* gate_softmax_weight */ true);
+            cb(cur, "ffn_moe_out", il);
+
+            cur = ggml_add(ctx0, cur, ffn_inp);
             cb(cur, "l_out", il);
 
             // input for next layer
@@ -16970,10 +17278,17 @@ static std::vector<struct ggml_cgraph *> llama_build_graph(
             ggml_set_name(cur, name);
         }
 
+        // build_llama/build_qwen2 split the model into one subgraph per layer-window
+        // (sched[0] = embeddings/output, sched[i>0] = layer windows), so sub_gf_id
+        // indexes lctx.sched directly. Monolithic single-graph arches (e.g. gpt-oss /
+        // OPENAI_MOE) return one cgraph, so lctx.sched is resized to 1 and every tensor
+        // lives in sched[0]. Clamp so the per-tensor backend hints below stay in range.
+        const int sched_idx = sub_gf_id < (int) lctx.sched.size() ? sub_gf_id : (int) lctx.sched.size() - 1;
+
         if (!lctx.cparams.offload_kqv) {
             if (strcmp(name, "kqv_merged_cont") == 0) {
                 // all nodes between the KV store and the attention output are run on the CPU
-                ggml_backend_sched_set_tensor_backend(lctx.sched[sub_gf_id], cur, lctx.backend_cpu);
+                ggml_backend_sched_set_tensor_backend(lctx.sched[sched_idx], cur, lctx.backend_cpu);
             }
         }
 
@@ -16986,7 +17301,7 @@ static std::vector<struct ggml_cgraph *> llama_build_graph(
                     int local_id = map_layer_to_local_id(il, n_world, my_rank, n_layer_window);
                     if (ggml_backend_supports_buft(backend, lctx.model.buft_layer[local_id].buft) &&
                         (ggml_backend_supports_op(backend, cur) || ggml_backend_offload_op(backend, cur))) {
-                        ggml_backend_sched_set_tensor_backend(lctx.sched[sub_gf_id], cur, backend);
+                        ggml_backend_sched_set_tensor_backend(lctx.sched[sched_idx], cur, backend);
                         break;
                     }
                 }
@@ -17000,7 +17315,7 @@ static std::vector<struct ggml_cgraph *> llama_build_graph(
 
     llm.init();
 
-    GGML_ASSERT((model.arch == LLM_ARCH_LLAMA || model.arch == LLM_ARCH_QWEN2) && "this model is currently not supported.\n");
+    GGML_ASSERT((model.arch == LLM_ARCH_LLAMA || model.arch == LLM_ARCH_QWEN2 || model.arch == LLM_ARCH_OPENAI_MOE) && "this model is currently not supported.\n");
 
     switch (model.arch) {
         case LLM_ARCH_LLAMA:
@@ -17058,6 +17373,10 @@ static std::vector<struct ggml_cgraph *> llama_build_graph(
         case LLM_ARCH_QWEN2MOE:
             {
                 result.push_back(llm.build_qwen2moe());
+            } break;
+        case LLM_ARCH_OPENAI_MOE:
+            {
+                result.push_back(llm.build_openai_moe());
             } break;
         case LLM_ARCH_PHI2:
             {
@@ -18515,7 +18834,12 @@ static int llama_decode_internal(
             }
 
             ubatch.activate_input  = (my_rank == 0 && i == 0);
-            ubatch.activate_output = (my_rank == 0 && is_out_embd);
+            // For a monolithic single-graph arch (e.g. gpt-oss / OPENAI_MOE) gf.size()==1,
+            // so i==0 is simultaneously the input and the output subgraph. The one graph
+            // computes end-to-end and emits "result_output" directly (extracted via `res`
+            // below), so the inter-node out_embd injection path must NOT fire — feeding the
+            // input tokens wins. Keep the two mutually exclusive.
+            ubatch.activate_output = (my_rank == 0 && is_out_embd && !ubatch.activate_input);
             GGML_ASSERT(!(ubatch.activate_input && ubatch.activate_output));
             
             llama_set_inputs(lctx, ubatch);
@@ -21543,6 +21867,7 @@ enum llama_rope_type llama_rope_type(const struct llama_model * model) {
         case LLM_ARCH_NEMOTRON:
         case LLM_ARCH_EXAONE:
         case LLM_ARCH_MINICPM3:
+        case LLM_ARCH_OPENAI_MOE:
             return LLAMA_ROPE_TYPE_NEOX;
 
         // all model arches should be listed explicitly here

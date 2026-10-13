@@ -12,12 +12,14 @@
 
 bool is_port_open(const std::string& ip, uint32_t port, int timeout_sec) {
 #ifdef _WIN32
-    static bool wsa_init = false;
-    if (!wsa_init) { WSADATA wsa; WSAStartup(MAKEWORD(2, 2), &wsa); wsa_init = true; }
-#endif
-
-    int sock = (int) socket(AF_INET, SOCK_STREAM, 0);
+    static const int wsa_result = [] { WSADATA wsa; return WSAStartup(MAKEWORD(2, 2), &wsa); }();
+    if (wsa_result != 0) return false;
+    SOCKET sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock == INVALID_SOCKET) return false;
+#else
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) return false;
+#endif
 
 #ifdef _WIN32
     DWORD tv = (DWORD) timeout_sec * 1000; // SO_*TIMEO is milliseconds on Windows

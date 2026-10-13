@@ -11,6 +11,8 @@
 //      asserted byte-for-byte.
 //   2. rcvtimeo: a recv with no sender returns the empty optional within
 //      ~500ms instead of hanging.
+//   3. Shutdown STOP waits for a late pipe and times out if none appears.
+//   4. Two ranks complete STOP and ACK before closing their senders.
 
 #include "zmq_nng_shim.hpp"
 
@@ -107,6 +109,78 @@ int main() {
         assert(rr.has_value() && *rr == 4);
         assert(in.to_string() == "STOP");
         std::printf("  [3] single send/recv message_t(\"STOP\",4) + to_string: OK\n");
+    }
+
+    // ---- Test 4: fresh asynchronous dial cannot use a one-shot send -----
+    {
+        zmq::context_t ctx(2);
+        zmq::socket_t pusher(ctx, zmq::socket_type::push);
+        pusher.connect("tcp://127.0.0.1:5602");
+        auto dropped = pusher.send(zmq::message_t("STOP", 4), zmq::send_flags::dontwait);
+        assert(!dropped && "fresh dial unexpectedly had a pipe");
+
+        pusher.set(zmq::sockopt::sndtimeo, 3000);
+        zmq::socket_t puller(ctx, zmq::socket_type::pull);
+        std::thread late_listener([&] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            puller.bind("tcp://127.0.0.1:5602");
+        });
+        auto sent = pusher.send(zmq::message_t("STOP", 4), zmq::send_flags::none);
+        late_listener.join();
+        assert(sent && *sent == 4 && "bounded send did not wait for the late pipe");
+        puller.set(zmq::sockopt::rcvtimeo, 3000);
+        zmq::message_t received;
+        auto got = puller.recv(received, zmq::recv_flags::none);
+        assert(got && *got == 4 && received.to_string() == "STOP");
+        std::printf("  [4] STOP reaches a listener bound after connect: OK\n");
+    }
+
+    // ---- Test 5: shutdown send stays bounded when no rank listens -------
+    {
+        zmq::context_t ctx(2);
+        zmq::socket_t pusher(ctx, zmq::socket_type::push);
+        pusher.set(zmq::sockopt::sndtimeo, 300);
+        pusher.connect("tcp://127.0.0.1:5603");
+        auto t0 = std::chrono::steady_clock::now();
+        auto sent = pusher.send(zmq::message_t("STOP", 4), zmq::send_flags::none);
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        assert(!sent && "send without a listener should time out");
+        assert(ms >= 200 && ms < 1500 && "send timeout exceeded shutdown bound");
+        std::printf("  [5] STOP send without a listener timed out in %lldms: OK\n", (long long) ms);
+    }
+
+    // ---- Test 6: two-rank STOP/ACK ring -------------------------------
+    {
+        zmq::context_t ctx(2);
+        zmq::socket_t rank0_in(ctx, zmq::socket_type::pull);
+        zmq::socket_t rank1_in(ctx, zmq::socket_type::pull);
+        rank0_in.bind("tcp://127.0.0.1:5604");
+        rank1_in.bind("tcp://127.0.0.1:5605");
+        rank0_in.set(zmq::sockopt::rcvtimeo, 3000);
+        rank1_in.set(zmq::sockopt::rcvtimeo, 3000);
+
+        std::thread worker([&] {
+            zmq::socket_t sender(ctx, zmq::socket_type::push);
+            sender.set(zmq::sockopt::sndtimeo, 3000);
+            sender.connect("tcp://127.0.0.1:5604");
+            zmq::message_t in;
+            assert(rank1_in.recv(in, zmq::recv_flags::none) && in.to_string() == "STOP");
+            assert(sender.send(in, zmq::send_flags::none));
+            assert(rank1_in.recv(in, zmq::recv_flags::none) && in.to_string() == "ACK");
+            assert(sender.send(in, zmq::send_flags::none));
+        });
+
+        zmq::socket_t sender(ctx, zmq::socket_type::push);
+        sender.set(zmq::sockopt::sndtimeo, 3000);
+        sender.connect("tcp://127.0.0.1:5605");
+        assert(sender.send(zmq::message_t("STOP", 4), zmq::send_flags::none));
+        zmq::message_t in;
+        assert(rank0_in.recv(in, zmq::recv_flags::none) && in.to_string() == "STOP");
+        assert(sender.send(zmq::message_t("ACK", 3), zmq::send_flags::none));
+        assert(rank0_in.recv(in, zmq::recv_flags::none) && in.to_string() == "ACK");
+        worker.join();
+        std::printf("  [6] two-rank STOP/ACK round trip: OK\n");
     }
 
     std::printf("PASS\n");

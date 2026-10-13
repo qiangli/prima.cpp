@@ -63,6 +63,7 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cassert>
 #include <cctype>
@@ -3447,6 +3448,7 @@ struct llama_context {
     zmq::socket_t  * recv_socket   = nullptr; 
     zmq::socket_t  * master_socket = nullptr; 
     zmq::socket_t  * signal_socket = nullptr;
+    std::atomic<bool> stop_requested{false};
 };
 
 struct llama_lora_weight {
@@ -20881,32 +20883,63 @@ int llama_recv_layer_setup(struct llama_context * ctx, uint32_t * n_layer_window
     return 0;
 }
 
-void llama_free_sockets(struct llama_context * ctx, char ** msg) {
+bool llama_stop_requested(const struct llama_context * ctx) {
+    return ctx->stop_requested.load(std::memory_order_acquire);
+}
+
+int llama_free_sockets(struct llama_context * ctx, char ** msg) {
     const uint32_t n_world   = ctx->cparams.n_world;
     const uint32_t my_rank   = ctx->cparams.rank;
     // to adapt to the new topology, use old next_rank
     const uint32_t next_rank = ctx->cparams.original_next_rank;
 
-    if (n_world == 1) return;
+    if (n_world == 1) return 0;
 
+    // A fresh nng dial has no pipe yet. Wait for one, but never let shutdown
+    // block forever if the next rank has already gone away.
+    constexpr int signal_timeout_ms = 5000;
     zmq::socket_t signal_sender(*ctx->sock_context, zmq::socket_type::push);
+    signal_sender.set(zmq::sockopt::sndtimeo, signal_timeout_ms);
     std::string endp = "tcp://" + ctx->next_node_ip + ":" + std::to_string(map_rank_to_port(next_rank, ctx->signal_port));
     signal_sender.connect(endp);
 
-    if (my_rank == 0) {
-        signal_sender.send(zmq::message_t("STOP", 4), zmq::send_flags::dontwait);
-    }
+    auto send_signal = [&](const char * value, size_t length) {
+        auto sent = signal_sender.send(zmq::message_t(value, length), zmq::send_flags::none);
+        return sent && *sent == length;
+    };
+    auto recv_signal = [&](const char * expected) {
+        zmq::message_t received;
+        auto result = ctx->signal_socket->recv(received, zmq::recv_flags::none);
+        return result && received.to_string() == expected;
+    };
 
-    zmq::message_t recv_msg;
-    if (ctx->signal_socket->recv(recv_msg, zmq::recv_flags::none)) {
-        std::string msg_str(static_cast<char*>(recv_msg.data()), recv_msg.size());
-        if (msg_str == "STOP" && my_rank != 0) {
-            signal_sender.send(recv_msg, zmq::send_flags::dontwait);
-        }
-        delete[] *msg;  // clean up the old message if any
-        *msg = new char[msg_str.size() + 1];
-        std::strcpy(*msg, msg_str.c_str());
+    int result = 0;
+    try {
+        if (my_rank == 0 && !send_signal("STOP", 4)) result = -1;
+        // Workers wait for STOP throughout inference. Once STOP arrives, all
+        // further waits have a deadline, including the acknowledgment round.
+        if (my_rank == 0) ctx->signal_socket->set(zmq::sockopt::rcvtimeo, signal_timeout_ms);
+        if (result == 0 && !recv_signal("STOP")) result = -1;
+        if (result == 0 && my_rank != 0 && !send_signal("STOP", 4)) result = -1;
+        if (result == 0 && my_rank != 0) ctx->signal_socket->set(zmq::sockopt::rcvtimeo, signal_timeout_ms);
+        // Keep each forwarding sender alive until the STOP has traversed the
+        // ring. An accepted nng send alone does not prove delivery on close.
+        if (result == 0 && my_rank == 0 && !send_signal("ACK", 3)) result = -1;
+        if (result == 0 && !recv_signal("ACK")) result = -1;
+        if (result == 0 && my_rank != 0 && !send_signal("ACK", 3)) result = -1;
+    } catch (const zmq::error_t & e) {
+        LLAMA_LOG_ERROR("Signal ring rank %u to %s failed: %s\n", my_rank, endp.c_str(), e.what());
+        result = -1;
     }
+    if (result != 0) {
+        LLAMA_LOG_ERROR("Signal ring rank %u to %s failed or timed out\n", my_rank, endp.c_str());
+    } else {
+        delete[] *msg;
+        *msg = new char[5];
+        std::strcpy(*msg, "STOP");
+    }
+    if (my_rank != 0) ctx->stop_requested.store(true, std::memory_order_release);
+    return result;
 }
 
 void llama_update_context_with_rankworld(struct llama_context * ctx, 

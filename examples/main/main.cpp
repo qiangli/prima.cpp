@@ -552,10 +552,11 @@ int main(int argc, char ** argv) {
     }
 
     char * stop_signal = nullptr;
+    int signal_result = 0;
     std::thread signal_thread;
 
     if (my_rank != 0) {
-        signal_thread = std::thread(llama_free_sockets, ctx, &stop_signal);
+        signal_thread = std::thread([&] { signal_result = llama_free_sockets(ctx, &stop_signal); });
     }
 
     while ((n_remain != 0 && !is_antiprompt) || params.interactive) {
@@ -675,7 +676,7 @@ int main(int argc, char ** argv) {
                 }
             } else {
                 llama_decode(ctx, llama_batch_get_one(embd.data(), 0, 0, 0));
-                if (stop_signal != nullptr && std::strcmp(stop_signal, "STOP") == 0) {
+                if (llama_stop_requested(ctx)) {
                     break;
                 }
             }
@@ -951,15 +952,16 @@ int main(int argc, char ** argv) {
         gpt_perf_print(ctx, smpl);
         write_logfile(ctx, params, model, input_tokens, output_ss.str(), output_tokens);
         gpt_sampler_free(smpl);
-        llama_free_sockets(ctx, &stop_signal);
+        signal_result = llama_free_sockets(ctx, &stop_signal);
     }
     if (my_rank != 0 && signal_thread.joinable()) {
         signal_thread.join();
     }
+    delete[] stop_signal;
     llama_free(ctx);
     llama_free_model(model);
     llama_backend_free();
     ggml_threadpool_free(threadpool);
     ggml_threadpool_free(threadpool_batch);
-    return 0;
+    return signal_result == 0 ? 0 : 1;
 }

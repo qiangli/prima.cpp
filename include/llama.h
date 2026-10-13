@@ -471,7 +471,8 @@ extern "C" {
     };
 
     LLAMA_API void llama_init_sockets      (struct llama_context * ctx, uint32_t n_world, uint32_t my_rank);
-    LLAMA_API void llama_free_sockets      (struct llama_context * ctx, char ** msg);
+    LLAMA_API int  llama_free_sockets      (struct llama_context * ctx, char ** msg);
+    LLAMA_API bool llama_stop_requested    (const struct llama_context * ctx);
     LLAMA_API int  llama_gather_device_info(struct llama_context * ctx, struct device_info * dev_info_set);
     LLAMA_API int  llama_send_device_info  (struct llama_context * ctx, struct device_info * dev_info);
     LLAMA_API int  llama_bcast_startup_args(struct llama_context * ctx, uint32_t rank, struct startup_args * args);

@@ -123,9 +123,11 @@ enum class recv_flags : int { none = 0, dontwait = 1 };
 
 namespace sockopt {
 struct rcvtimeo_t {};
+struct sndtimeo_t {};
 struct linger_t   {};
 struct rcvmore_t  {};
 inline constexpr rcvtimeo_t rcvtimeo{};
+inline constexpr sndtimeo_t sndtimeo{};
 inline constexpr linger_t   linger{};
 inline constexpr rcvmore_t  rcvmore{};
 } // namespace sockopt
@@ -225,6 +227,10 @@ public:
         // cppzmq: -1 == infinite; nng NNG_DURATION_INFINITE is also -1.
         int rv = nng_socket_set_ms(sock_, NNG_OPT_RECVTIMEO, (nng_duration) ms);
         if (rv != 0) throw error_t(rv, "set rcvtimeo");
+    }
+    void set(sockopt::sndtimeo_t, int ms) {
+        int rv = nng_socket_set_ms(sock_, NNG_OPT_SENDTIMEO, (nng_duration) ms);
+        if (rv != 0) throw error_t(rv, "set sndtimeo");
     }
     void set(sockopt::linger_t, int ms) {
         // nng has no socket-level linger equivalent; keep for compatibility.

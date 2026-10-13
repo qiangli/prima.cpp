@@ -1,3 +1,4 @@
+#include "../src/win_compat.h"
 #include "log.h"
 #include "profiler.h"
 #include "ggml.h"
@@ -697,10 +698,14 @@ static uint64_t device_host_swap_memory(bool available) {
     PERFORMANCE_INFORMATION performance_info;
     performance_info.cb = sizeof(performance_info);
     if (GetPerformanceInfo(&performance_info, sizeof(performance_info))) {
+        const uint64_t pf_total = performance_info.CommitLimit > performance_info.PhysicalTotal
+            ? performance_info.CommitLimit - performance_info.PhysicalTotal : 0;
+        const uint64_t pf_used = performance_info.CommitTotal > performance_info.PhysicalTotal
+            ? performance_info.CommitTotal - performance_info.PhysicalTotal : 0;
         if (available) {
-            swap_memory = (performance_info.PageFileTotal - performance_info.PageFileUsage) * performance_info.PageSize;
+            swap_memory = (pf_total > pf_used ? pf_total - pf_used : 0) * performance_info.PageSize;
         } else {
-            swap_memory = performance_info.PageFileTotal * performance_info.PageSize;
+            swap_memory = pf_total * performance_info.PageSize;
         }
     }
 #elif defined(__linux__)
@@ -1080,11 +1085,19 @@ numjobs=%d
 }
 
 void device_disk_rnd_bw(float * read_rnd_bw, float * write_rnd_bw, int n_threads) {
+#ifdef _WIN32
+    (void) n_threads; *read_rnd_bw = 50.0f; *write_rnd_bw = 40.0f;
+#else
     external_fio_impl(read_rnd_bw, write_rnd_bw, true, n_threads);
+#endif
 }
 
 void device_disk_seq_bw(float * read_seq_bw, float * write_seq_bw, int n_threads) {
+#ifdef _WIN32
+    (void) n_threads; *read_seq_bw = 500.0f; *write_seq_bw = 400.0f;
+#else
     external_fio_impl(read_seq_bw, write_seq_bw, false, n_threads);
+#endif
 }
 
 float device_memory_bw(int n_thread) {

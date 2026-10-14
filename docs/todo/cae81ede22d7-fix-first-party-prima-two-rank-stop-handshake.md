@@ -3,7 +3,7 @@ id: cae81ede22d7
 kind: bug
 title: Fix first-party Prima two-rank STOP handshake
 seq: 1
-status: assigned
+status: done
 priority: p1
 created: 2026-10-13T14:56:58.182848Z
 weave: 1
@@ -11,6 +11,8 @@ assignee: codex-gpt6-sol
 sprint: 436
 sprint_id: 20ad6f7b-d3d3-5ebf-973c-0bbb999db96f
 sprint_title: 'Sphere regression recovery: p2p sharding + local inference back on, bashy-built engines'
+closed: 2026-10-13T15:13:31.27803Z
+closed_by: s436-codex-manager
 ---
 
 Hosted Bashy CI candidate -4 run 38416093564: all four native builds, ring transport, single-rank inference pass; two-rank rank1 timeout on all platforms. Source at reviewed f4ea9845: examples/main/main.cpp rank0 prints perf then calls llama_free_sockets; src/llama.cpp llama_free_sockets creates new nng PUSH, connects asynchronously, sends STOP with dontwait and ignores optional result, then waits ring reply; rank1 signal_thread waits recv. Investigate transport evidence and this lost-STOP hypothesis; make minimal first-party source fix preserving bounded two-rank shutdown, add focused regression coverage where possible. Commit with Sprint/Story/Story-ID trailers; no push/tag, no Dragon native build/container/full suite. Report if hypothesis disproven. Manager will review, push, tag new source version, update Bashy pin and hosted CI.
